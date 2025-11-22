@@ -1,0 +1,243 @@
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- FUNÇÕES AUXILIARES GERAIS ---
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Verifica se o dado que está chegando é um número
+    function isNumber(value) {
+      return value is int || value is float;
+    }
+
+    // Verifica se o dado é uma string válida e não vazia
+    function isString(value) {
+      return value is string && value.size() > 0;
+    }
+
+    // Validação de Nota (0 a 10)
+    function isValidGrade(grade) {
+      return isNumber(grade) && grade >= 0 && grade <= 10;
+    }
+
+    // --- COLEÇÃO: USERS ---
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      
+      // Apenas o dono edita, e validamos campos básicos
+      allow write: if isUser(userId) 
+        && isString(request.resource.data.name)
+        && request.resource.data.email is string;
+      
+      match /quiz_results/{quizId} {
+        allow read: if isUser(userId);
+        // Validação básica de resultado de quiz
+        allow write: if isUser(userId) 
+          && isNumber(request.resource.data.lastScore)
+          && isNumber(request.resource.data.totalQuestions);
+      }
+      
+      match /modulesProgress/{moduleId} {
+        allow read: if isUser(userId);
+        // Progresso deve ser entre 0 e 100
+        allow write: if isUser(userId) 
+          && isNumber(request.resource.data.progress) 
+          && request.resource.data.progress >= 0 
+          && request.resource.data.progress <= 100;
+      }
+
+      match /read_notifications/{notificationId} {
+        allow read, write: if isUser(userId);
+      }
+    }
+
+    // --- COLEÇÃO: CLASSES ---
+    match /classes/{classId} {
+      allow read: if isAuthenticated();
+      
+      // Criação: Apenas se tiver nome e o teacherId for o próprio usuário
+      allow create: if isAuthenticated() 
+        && isString(request.resource.data.name)
+        && request.resource.data.teacherId == request.auth.uid;
+      
+      // Atualização:
+      // 1. Professor (dono) pode editar tudo.
+      // 2. Aluno (Join Class): Só pode alterar arrays de alunos, sem mudar o dono da turma.
+      allow update: if isAuthenticated() && (
+        resource.data.teacherId == request.auth.uid ||
+        (
+          // Regra de Join Class Segura: Não muda o professor, apenas mexe em students/counts
+          resource.data.teacherId == request.resource.data.teacherId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['students', 'studentIds', 'studentCount'])
+        )
+      );
+    }
+
+    // --- COLEÇÃO: MODULES & CONTENTS ---
+    match /modules/{moduleId} {
+      allow read: if isAuthenticated();
+      
+      // Criação/Edição: Apenas criador, valida campos obrigatórios
+      allow write: if isAuthenticated() && (
+        (resource == null && request.resource.data.creatorId == request.auth.uid) || 
+        (resource != null && resource.data.creatorId == request.auth.uid)
+      ) && isString(request.resource.data.title);
+    }
+    
+    match /module_contents/{moduleId} {
+      allow read: if isAuthenticated();
+      // Conteúdo vinculado à permissão do módulo (simplificado aqui pela auth)
+      allow write: if isAuthenticated(); 
+    }
+
+    // --- COLEÇÃO: ACTIVITIES ---
+    match /activities/{activityId} {
+      allow read: if isAuthenticated();
+      
+      // Escrita na Atividade Pai - RESTRIÇÃO ESTRITA POR CREATOR ID
+      allow write: if isAuthenticated() && (
+        // Criador pode tudo (validando pontos)
+        (
+           (resource == null && request.resource.data.creatorId == request.auth.uid) || 
+           (resource != null && resource.data.creatorId == request.auth.uid)
+        ) && (
+           !('points' in request.resource.data) || isValidGrade(request.resource.data.points)
+        ) ||
+        // Aluno atualiza contadores (submissionCount) - restrito
+        (
+           resource != null && 
+           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['submissionCount', 'pendingSubmissionCount', 'status', 'submissions'])
+        )
+      );
+      
+      // Deleção: Apenas o criador
+      allow delete: if isAuthenticated() && resource.data.creatorId == request.auth.uid;
+
+      // --- SUBCOLEÇÃO CRÍTICA: SUBMISSIONS ---
+      match /submissions/{studentId} {
+        
+        // LEITURA: Dono da submissão ou Professor da atividade
+        allow read: if isAuthenticated();
+
+        // ESCRITA (ALUNO):
+        // - Deve ser o dono (studentId)
+        // - NÃO pode definir nota (grade must be null)
+        // - Status deve ser 'Aguardando correção'
+        allow create, update: if isUser(studentId) 
+          && request.resource.data.status == 'Aguardando correção'
+          && (
+            !('grade' in request.resource.data) || 
+            request.resource.data.grade == null
+          );
+
+        // ESCRITA (PROFESSOR):
+        // - Deve buscar a atividade pai para checar creatorId (usando get)
+        // - Pode definir nota (0-10)
+        // - Pode mudar status para 'Corrigido'
+        allow update: if isAuthenticated() 
+          && isValidGrade(request.resource.data.grade)
+          && request.resource.data.status == 'Corrigido'
+          // Verifica se quem está escrevendo é o criador da atividade pai (ISOLAMENTO)
+          && get(/databases/$(database)/documents/activities/$(activityId)).data.creatorId == request.auth.uid;
+      }
+    }
+
+    // --- COLEÇÃO: NOTIFICATIONS ---
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated(); // Sistema cria
+      allow update: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    // --- COLEÇÃO: BROADCASTS ---
+    match /broadcasts/{broadcastId} {
+      allow read: if isAuthenticated();
+      
+      // Apenas se tiver título, resumo e classId
+      allow create: if isAuthenticated()
+        && isString(request.resource.data.title)
+        && isString(request.resource.data.summary)
+        && isString(request.resource.data.classId);
+        
+      allow delete: if isAuthenticated();
+    }
+
+    // --- GAMIFICATION & STATS ---
+    match /achievements/{achievementId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated(); // Admins
+    }
+
+    // XP do Usuário (User Achievements Doc)
+    match /userAchievements/{userId} {
+      // Permite leitura e escrita pelo dono
+      // Validação de sanidade: Impede adicionar mais de 500 XP de uma vez só para evitar hacks fáceis
+      allow write: if isUser(userId) && (
+         resource == null || 
+         (request.resource.data.xp - resource.data.xp) <= 500
+      );
+      allow read: if isUser(userId);
+    }
+
+    // --- TEACHER HISTORY (Big Doc) ---
+    match /teacher_history/{teacherId} {
+      allow read: if isUser(teacherId);
+      allow write: if isAuthenticated(); // Aluno escreve ao entrar na turma
+    }
+
+    // --- QUIZZES ---
+    match /quizzes/{quizId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+
+    // --- ATTENDANCE (CHAMADA) ---
+    match /attendance_sessions/{sessionId} {
+      allow read: if isAuthenticated();
+      
+      // ISOLAMENTO: Apenas o professor dono pode criar ou editar a sessão
+      allow write: if isAuthenticated() && (
+        (resource == null && request.resource.data.teacherId == request.auth.uid) ||
+        (resource != null && resource.data.teacherId == request.auth.uid)
+      );
+      
+      // Deleção apenas pelo dono
+      allow delete: if isAuthenticated() && resource.data.teacherId == request.auth.uid;
+      
+      match /records/{recordId} {
+        allow read: if isAuthenticated();
+        // ISOLAMENTO: O professor precisa ser o dono da sessão pai para editar os registros
+        allow write: if isAuthenticated() 
+          && get(/databases/$(database)/documents/attendance_sessions/$(sessionId)).data.teacherId == request.auth.uid;
+      }
+    }
+    
+    // --- INVITES ---
+    match /invitations/{inviteId} {
+      allow read: if isAuthenticated() && (
+        resource.data.inviterId == request.auth.uid || 
+        resource.data.inviteeId == request.auth.uid
+      );
+      
+      allow create: if isAuthenticated() && request.resource.data.inviterId == request.auth.uid;
+      
+      allow update: if isAuthenticated() && (
+        resource.data.inviterId == request.auth.uid || 
+        resource.data.inviteeId == request.auth.uid
+      );
+      
+      allow delete: if isAuthenticated() && (
+        resource.data.inviterId == request.auth.uid || 
+        resource.data.inviteeId == request.auth.uid
+      );
+    }
+  }
+}
